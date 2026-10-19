@@ -1,0 +1,16 @@
+# Third-party data: local use only, do not republish (see NOTICE.md)
+data/external/
+data/*.npz
+
+# Your own recordings and settings
+settings.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Temporary check images
+reports/_*.png
