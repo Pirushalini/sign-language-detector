@@ -1,0 +1,39 @@
+{
+  "name": "rf_ext",
+  "data_source": "ext",
+  "classes": [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "I",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Z"
+  ],
+  "hyperparameters": {
+    "clf__n_estimators": 200,
+    "clf__max_depth": null,
+    "clf__min_samples_leaf": 1
+  },
+  "feature_dim": 132,
+  "sklearn_pipeline_steps": [
+    "scaler",
+    "clf"
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "name": "knn_comb",
+  "data_source": "combined",
+  "classes": [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z"
+  ],
+  "hyperparameters": {
+    "clf__n_neighbors": 5,
+    "clf__weights": "distance"
+  },
+  "feature_dim": 132,
+  "sklearn_pipeline_steps": [
+    "scaler",
+    "clf"
+  ]
+}

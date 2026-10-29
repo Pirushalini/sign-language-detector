@@ -28,6 +28,8 @@ class Settings:
     auto_space: bool = False
     auto_space_delay: float = 2.0   # seconds without hands before a space is added
     camera_index: int = 0
+    backend: str = "template"       # "template" or "ml"
+    ml_model: str = "svm_ext"       # saved model identifier in models/
 
     RANGES = {
         "hold_time": (0.3, 2.5), "threshold": (0.5, 0.99), "smoothing": (1, 15),
@@ -39,6 +41,10 @@ class Settings:
             value = getattr(self, name)
             value = min(max(value, lo), hi)
             setattr(self, name, int(round(value)) if isinstance(getattr(Settings, name), int) else float(value))
+        if self.backend not in ("template", "ml"):
+            self.backend = "template"
+        if not isinstance(self.ml_model, str) or not self.ml_model:
+            self.ml_model = "svm_ext"
         return self
 
     @classmethod
@@ -50,7 +56,7 @@ class Settings:
         except (OSError, ValueError):
             return s
         for f in fields(cls):
-            if f.name in data and isinstance(data[f.name], (int, float, bool)):
+            if f.name in data and isinstance(data[f.name], (int, float, bool, str)):
                 try:
                     setattr(s, f.name, type(getattr(s, f.name))(data[f.name]))
                 except (TypeError, ValueError):

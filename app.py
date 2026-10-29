@@ -203,6 +203,15 @@ class SettingsWindow(ctk.CTkToplevel):
             row += 1
         self._add_slider(row, "auto_space_delay", "Auto-space delay", 1.0, 5.0, 8, lambda v: f"{v:.1f} s")
         row += 2
+        ctk.CTkLabel(self, text="Recognition Method", text_color=TEXT, font=make_font(13), anchor="w").grid(
+            row=row, column=0, sticky="w", padx=(20, 0), pady=(12, 0))
+        self._backend_menu = ctk.CTkOptionMenu(
+            self, values=["Template Matching", "Machine Learning (SVM)"],
+            command=self._on_backend_change, font=make_font(12),
+            fg_color=ACCENT, button_color=ACCENT_HOVER,
+        )
+        self._backend_menu.grid(row=row, column=1, sticky="e", padx=20, pady=(12, 0))
+        row += 1
         bar = ctk.CTkFrame(self, fg_color=BG)
         bar.grid(row=row, column=0, columnspan=2, sticky="ew", padx=20, pady=24)
         secondary_button(bar, "Reset to defaults", self._reset, width=160).pack(side="left")
@@ -232,6 +241,15 @@ class SettingsWindow(ctk.CTkToplevel):
         setattr(self.app.settings, key, bool(self._switches[key].get()))
         self.app.apply_settings()
 
+    def _on_backend_change(self, choice: str) -> None:
+        if "Machine Learning" in choice:
+            self.app.settings.backend = "ml"
+            self.app.settings.ml_model = "svm_ext"
+        else:
+            self.app.settings.backend = "template"
+        self.app.reload_matcher()
+        self.app.apply_settings()
+
     def _refresh(self) -> None:
         for key, (slider, value_label, fmt) in self._sliders.items():
             value = getattr(self.app.settings, key)
@@ -239,6 +257,9 @@ class SettingsWindow(ctk.CTkToplevel):
             value_label.configure(text=fmt(value))
         for key, sw in self._switches.items():
             sw.select() if getattr(self.app.settings, key) else sw.deselect()
+        backend_name = "Machine Learning (SVM)" if getattr(self.app.settings, "backend", "template") == "ml" else "Template Matching"
+        if hasattr(self, "_backend_menu"):
+            self._backend_menu.set(backend_name)
 
     def _reset(self) -> None:
         defaults = Settings()
@@ -286,6 +307,18 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------- setup
     def _load_matcher(self):
+        backend_mode = getattr(self.settings, "backend", "template")
+        if backend_mode == "ml":
+            try:
+                from ml.backend import MLBackend, BACKEND_ML
+                model_name = getattr(self.settings, "ml_model", "svm_ext")
+                backend = MLBackend(mode=BACKEND_ML, model_name=model_name)
+                backend.load()
+                if backend.available:
+                    return backend, ""
+            except Exception:
+                pass  # Fall back to template matching on any load error
+
         try:
             matcher = TemplateMatcher.from_files(reject_distance=self.settings.max_distance)
         except ValueError as exc:
@@ -294,6 +327,15 @@ class App(ctk.CTk):
             return matcher, ("No templates found. Run import_dataset.py and/or calibrate.py first. "
                              "Predictions are disabled until then.")
         return matcher, ""
+
+    def reload_matcher(self) -> None:
+        """Reload the recognition backend (e.g. after switching backend in settings)."""
+        self.matcher, self.model_message = self._load_matcher()
+        if hasattr(self.matcher, "reject_distance"):
+            self.matcher.reject_distance = self.settings.max_distance
+        if getattr(self, "worker", None) is not None:
+            self.worker.matcher = self.matcher
+        self._refresh_banner()
 
     def _card(self, master, **grid):
         card = ctk.CTkFrame(master, fg_color=PANEL, corner_radius=12)
