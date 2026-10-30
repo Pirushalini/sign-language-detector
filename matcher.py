@@ -64,11 +64,18 @@ class TemplateMatcher:
                    (below 1 means your own samples are preferred)
     temperature:   turns letter scores into probabilities (smaller = sharper)
     reject_distance: if the best score is above this, nothing is returned
+    feature_weights: optional per-feature weight vector (one value per column of X). When
+                   given it replaces inter_weight / flag_weight completely. A weight w
+                   scales the squared difference of that feature, so w = 0 switches a
+                   feature off. Used by the weighting experiments (experiments/).
+    n_features:    width of the feature vectors (default 132). Experiments may append
+                   extra columns (for example palm-side values).
     """
 
     def __init__(self, k: int = 3, metric: str = "euclidean", inter_weight: float = 2.0,
                  flag_weight: float = 3.0, user_weight: float = 0.85,
-                 temperature: float = 0.12, reject_distance: float = 1.5):
+                 temperature: float = 0.12, reject_distance: float = 1.5,
+                 feature_weights: Optional[np.ndarray] = None, n_features: int = FEATURE_LEN):
         self.k = k
         self.metric = metric
         self.inter_weight = inter_weight
@@ -76,7 +83,8 @@ class TemplateMatcher:
         self.user_weight = user_weight
         self.temperature = temperature
         self.reject_distance = reject_distance
-        self.X = np.zeros((0, FEATURE_LEN), dtype=np.float32)
+        self.feature_weights = feature_weights
+        self.X = np.zeros((0, n_features), dtype=np.float32)
         self.y = np.array([], dtype="<U8")
         self.src = np.array([], dtype=np.int8)
         self._dirty = True
@@ -128,9 +136,15 @@ class TemplateMatcher:
         self._dirty = True
 
     def _prepare(self) -> None:
-        w = np.ones(FEATURE_LEN, dtype=np.float32)
-        w[INTER_START:FLAGS_START] = self.inter_weight
-        w[FLAGS_START:] = self.flag_weight
+        n = self.X.shape[1]
+        if self.feature_weights is not None:
+            w = np.asarray(self.feature_weights, dtype=np.float32)
+            if w.shape != (n,):
+                raise ValueError(f"feature_weights has shape {w.shape}, expected ({n},)")
+        else:
+            w = np.ones(n, dtype=np.float32)
+            w[INTER_START:FLAGS_START] = self.inter_weight
+            w[FLAGS_START:FEATURE_LEN] = self.flag_weight
         self._sqrt_w = np.sqrt(w)
         Xw = self.X * self._sqrt_w
         if self.metric == "cosine":

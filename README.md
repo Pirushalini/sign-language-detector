@@ -138,6 +138,7 @@ On a server without a screen, run the window tests under a virtual display:
 | `import_dataset.py` | converts the public CSV files into templates |
 | `calibrate.py` | guided recording of your own templates |
 | `evaluate.py` | accuracy report, confusion matrix and ablations |
+| `experiments/`, `record_palm_side.py` | weighting, palm-side and confidence experiments (see `EXPERIMENTS.md`) |
 | `tests/` | automated tests |
 
 ## Credits
