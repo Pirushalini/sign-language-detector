@@ -1,6 +1,6 @@
 """Sign Language Detector: desktop app (CustomTkinter, light theme).
 
-Camera feed on the left, detected letter and text on the right. 
+Camera feed on the left, detected letter and text on the right.
 Detection runs in a background thread; the window only draws results, so it stays responsive.
 
 Run:  python app.py
@@ -18,11 +18,13 @@ from typing import Dict, List, Optional
 import cv2
 import customtkinter as ctk
 import numpy as np
+# pyrefly: ignore[missing-import]
 from PIL import Image
 
-from logic import HoldToAdd, Settings, Smoother
+from logic import HoldToAdd, PracticeSession, Settings, Smoother
 from matcher import Prediction, TemplateMatcher
-from utils import SETTINGS_PATH, HandTracker, build_features, list_cameras, open_camera
+from motion import DYNAMIC_LETTERS, MotionRecognizer, MotionResult
+from utils import CHART_PATH, ROOT, SETTINGS_PATH, HandTracker, build_features, list_cameras, open_camera
 
 # ------------------------------------------------------------------ style
 BG = "#FFFFFF"
@@ -68,17 +70,19 @@ class DetectorWorker(threading.Thread):
     """Reads the camera, tracks hands and matches templates in the background.
 
     Results go to a queue as dictionaries:
-        {"type": "frame", "image": RGB array, "hands": int, "pred": Prediction or None, "fps": float}
+        {"type": "frame", "image": RGB array, "hands": int, "pred": Prediction or None, "fps": float, "motion": MotionResult or None}
         {"type": "status", "state": "starting" | "running" | "stopped"}
         {"type": "error", "message": str}
     """
 
-    def __init__(self, camera_index: int, matcher: TemplateMatcher, settings: Settings, out: "queue.Queue"):
+    def __init__(self, camera_index: int, matcher: TemplateMatcher, settings: Settings, out: "queue.Queue",
+                 motion_recognizer: Optional[MotionRecognizer] = None):
         super().__init__(daemon=True)
         self.camera_index = camera_index
         self.matcher = matcher
         self.settings = settings
         self.out = out
+        self.motion_recognizer = motion_recognizer
         self._stop_flag = threading.Event()
         self.paused = threading.Event()
 
@@ -143,8 +147,18 @@ class DetectorWorker(threading.Thread):
                 h, w = frame.shape[:2]
                 hands, result = tracker.process(frame)       # always on the raw frame
                 pred: Optional[Prediction] = None
-                if hands and self.matcher.available:
+                motion_res: Optional[MotionResult] = None
+                is_tracking = False
+
+                now = time.monotonic()
+                if hands and self.motion_recognizer is not None and self.motion_recognizer.available:
+                    motion_res = self.motion_recognizer.process_frame(hands, now)
+                    is_tracking = self.motion_recognizer.is_tracking
+
+                # If dynamic gesture is being actively tracked, suppress static predictions
+                if hands and self.matcher.available and not is_tracking:
                     pred = self.matcher.predict(build_features(hands, aspect=w / h))
+
                 if self.settings.show_landmarks:
                     tracker.draw(frame, result)
                 if self.settings.mirror:
@@ -153,12 +167,19 @@ class DetectorWorker(threading.Thread):
                     frame = cv2.resize(frame, (960, int(h * 960 / w)))
                 last_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                now = time.monotonic()
                 dt = now - last_t
                 last_t = now
                 if dt > 0:
                     fps = 1.0 / dt if fps == 0 else 0.9 * fps + 0.1 / dt
-                self._put({"type": "frame", "image": last_rgb, "hands": len(hands), "pred": pred, "fps": fps})
+                self._put({
+                    "type": "frame",
+                    "image": last_rgb,
+                    "hands": len(hands),
+                    "pred": pred,
+                    "fps": fps,
+                    "motion": motion_res,
+                    "is_tracking": is_tracking,
+                })
         except Exception as exc:  # keep any tracking problem away from the user as a traceback
             self._put({"type": "error", "message": f"Camera or tracking problem: {exc}"})
         finally:
@@ -283,8 +304,12 @@ class App(ctk.CTk):
 
         self.settings = Settings.load(SETTINGS_PATH)
         self.matcher, self.model_message = self._load_matcher()
+        self.motion_recognizer = MotionRecognizer.from_files()
         self.smoother = Smoother(self.settings.smoothing)
         self.hold = HoldToAdd()
+        self.practice: Optional[PracticeSession] = None
+        self.practice_hold: Optional[HoldToAdd] = None
+        self._practice_pause_until = 0.0
         self.text = ""
         self.queue: "queue.Queue" = queue.Queue(maxsize=4)
         self.worker: Optional[DetectorWorker] = None
@@ -292,6 +317,8 @@ class App(ctk.CTk):
         self.error_message = ""
         self.settings_window: Optional[SettingsWindow] = None
         self._cam_image = None
+        self._chart_image = None
+        self._chart_pil: Optional[Image.Image] = None
         self._autostart = autostart
         self._cache: Dict[str, object] = {}
 
@@ -331,10 +358,12 @@ class App(ctk.CTk):
     def reload_matcher(self) -> None:
         """Reload the recognition backend (e.g. after switching backend in settings)."""
         self.matcher, self.model_message = self._load_matcher()
+        self.motion_recognizer = MotionRecognizer.from_files()
         if hasattr(self.matcher, "reject_distance"):
             self.matcher.reject_distance = self.settings.max_distance
         if getattr(self, "worker", None) is not None:
             self.worker.matcher = self.matcher
+            self.worker.motion_recognizer = self.motion_recognizer
         self._refresh_banner()
 
     def _card(self, master, **grid):
@@ -354,9 +383,11 @@ class App(ctk.CTk):
         main.columnconfigure(0, weight=3, uniform="cols")
         main.columnconfigure(1, weight=2, uniform="cols")
         main.rowconfigure(0, weight=1)
+        main.rowconfigure(1, weight=0)
 
         self._build_left(main)
         self._build_right(main)
+        self._build_tabs(main)
 
     def _build_left(self, main) -> None:
         left = self._card(main, row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
@@ -393,6 +424,25 @@ class App(ctk.CTk):
                                              text_color=TEXT, dropdown_fg_color=BG, dropdown_text_color=TEXT,
                                              dropdown_hover_color=PANEL, font=make_font(13), width=130, height=36)
         self.camera_menu.pack(side="left", padx=(8, 0))
+        self.record_motion_button = secondary_button(controls, "Record Motion", self.open_motion_recorder, width=120)
+        self.record_motion_button.pack(side="left", padx=(8, 0))
+
+    def open_motion_recorder(self) -> None:
+        import subprocess
+        was_running = self.worker is not None
+        if was_running:
+            self.stop_camera()
+        messagebox.showinfo(
+            "Record Motion",
+            "Launching BSL Dynamic Gesture Recorder (record_motion.py)...\n\n"
+            "Camera in main app has been stopped to release the webcam.\n"
+            "Restart camera in main app when recording is complete.",
+            parent=self,
+        )
+        try:
+            subprocess.Popen([sys.executable, str(ROOT / "record_motion.py")])
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to start recorder: {exc}", parent=self)
 
     def _build_right(self, main) -> None:
         right = ctk.CTkFrame(main, fg_color=BG)
@@ -404,7 +454,9 @@ class App(ctk.CTk):
         letter = self._card(right, row=0, column=0, sticky="ew", pady=(0, 8))
         letter.columnconfigure(1, weight=1)
         ctk.CTkLabel(letter, text="DETECTED LETTER", font=make_font(12, "bold"), text_color=MUTED).grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 0))
+            row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 0))
+        self.mode_badge = ctk.CTkLabel(letter, text="Mode: Static", font=make_font(12, "bold"), text_color=ACCENT)
+        self.mode_badge.grid(row=0, column=2, sticky="e", padx=16, pady=(10, 0))
         self.letter_label = ctk.CTkLabel(letter, text="-", font=make_font(56, "bold"), text_color=TEXT)
         self.letter_label.grid(row=1, column=0, columnspan=3, pady=(0, 2))
         ctk.CTkLabel(letter, text="Confidence", font=make_font(13), text_color=MUTED).grid(
@@ -420,7 +472,9 @@ class App(ctk.CTk):
         self.hold_bar.set(0)
         self.hold_bar.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(0, 16), pady=(8, 0))
         self.top3_label = ctk.CTkLabel(letter, text="Top 3:  -", font=make_font(13), text_color=TEXT, anchor="w")
-        self.top3_label.grid(row=4, column=0, columnspan=3, sticky="w", padx=16, pady=(6, 10))
+        self.top3_label.grid(row=4, column=0, columnspan=3, sticky="w", padx=16, pady=(6, 2))
+        self.motion_status_label = ctk.CTkLabel(letter, text="Motion: Ready", font=make_font(12), text_color=MUTED, anchor="w")
+        self.motion_status_label.grid(row=5, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 10))
 
         # Detected text card
         text_card = self._card(right, row=1, column=0, sticky="nsew")
@@ -439,6 +493,62 @@ class App(ctk.CTk):
                 row=2, column=col, sticky="ew", padx=(16 if col == 0 else 3, 16 if col == 3 else 3), pady=(10, 0))
         self.text_note = ctk.CTkLabel(text_card, text=SHORTCUT_NOTE, font=make_font(12), text_color=MUTED, anchor="w")
         self.text_note.grid(row=3, column=0, columnspan=4, sticky="w", padx=16, pady=(8, 10))
+
+    def _build_tabs(self, main) -> None:
+        tabs = ctk.CTkTabview(main, height=230, fg_color=PANEL, corner_radius=12,
+                              segmented_button_fg_color=BORDER, segmented_button_selected_color=BG,
+                              segmented_button_selected_hover_color=BG, segmented_button_unselected_color=BORDER,
+                              segmented_button_unselected_hover_color="#D1D5DB", text_color=TEXT)
+        tabs.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.tabs = tabs
+        chart_tab = tabs.add("Reference Chart")
+        practice_tab = tabs.add("Practice Mode")
+
+        # Reference chart
+        self.chart_box = ctk.CTkFrame(chart_tab, fg_color=PANEL)
+        self.chart_box.pack(fill="both", expand=True)
+        self.chart_box.pack_propagate(False)
+        self.chart_label = ctk.CTkLabel(self.chart_box, text="", text_color=MUTED, font=make_font(14))
+        self.chart_label.place(relx=0.5, rely=0.5, anchor="center")
+        if CHART_PATH.exists():
+            try:
+                self._chart_pil = Image.open(CHART_PATH).convert("RGB")
+            except OSError:
+                self._chart_pil = None
+        if self._chart_pil is None:
+            self.chart_label.configure(text="Reference chart not found. Put your chart image at "
+                                            "assets/alphabet_chart.png")
+        else:
+            secondary_button(self.chart_box, "Open larger", self.open_chart_large, width=110, height=30).place(
+                relx=1.0, rely=0.0, anchor="ne", x=-4, y=2)
+            self.chart_box.bind("<Configure>", lambda e: self.after(60, self._fit_chart))
+
+        # Practice mode
+        practice_tab.columnconfigure((0, 1, 2), weight=1)
+        left = ctk.CTkFrame(practice_tab, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=12)
+        self.practice_button = primary_button(left, "Start Practice", self.toggle_practice, width=150)
+        self.practice_button.pack(pady=(24, 8))
+        self.skip_button = secondary_button(left, "Skip", self.skip_practice, width=150, state="disabled")
+        self.skip_button.pack()
+        middle = ctk.CTkFrame(practice_tab, fg_color="transparent")
+        middle.grid(row=0, column=1, sticky="nsew")
+        ctk.CTkLabel(middle, text="Target letter", font=make_font(13), text_color=MUTED).pack(pady=(14, 0))
+        self.target_label = ctk.CTkLabel(middle, text="-", font=make_font(72, "bold"), text_color=ACCENT)
+        self.target_label.pack()
+        self.practice_sign = ctk.CTkLabel(middle, text="Your sign: -", font=make_font(14), text_color=TEXT)
+        self.practice_sign.pack()
+        stats = ctk.CTkFrame(practice_tab, fg_color="transparent")
+        stats.grid(row=0, column=2, sticky="nsew", padx=12)
+        self.score_label = ctk.CTkLabel(stats, text="Score: 0", font=make_font(18, "bold"), text_color=TEXT)
+        self.score_label.pack(pady=(28, 2), anchor="w")
+        self.streak_label = ctk.CTkLabel(stats, text="Streak: 0", font=make_font(15), text_color=TEXT)
+        self.streak_label.pack(anchor="w")
+        self.best_label = ctk.CTkLabel(stats, text="Best streak: 0", font=make_font(15), text_color=MUTED)
+        self.best_label.pack(anchor="w")
+        self.practice_message = ctk.CTkLabel(stats, text="Press Start Practice, then hold the target sign.",
+                                             font=make_font(13), text_color=MUTED, wraplength=260, justify="left")
+        self.practice_message.pack(pady=(10, 0), anchor="w")
 
     def _bind_keys(self) -> None:
         self.bind("<BackSpace>", lambda e: self.erase())
@@ -511,7 +621,10 @@ class App(ctk.CTk):
         self.smoother.reset()
         self.hold.reset()
         self.hold.set_text_state(self.text)
-        self.worker = DetectorWorker(self.settings.camera_index, self.matcher, self.settings, self.queue)
+        if hasattr(self, "motion_recognizer") and self.motion_recognizer is not None:
+            self.motion_recognizer.reset()
+        motion_rec = getattr(self, "motion_recognizer", None)
+        self.worker = DetectorWorker(self.settings.camera_index, self.matcher, self.settings, self.queue, motion_rec)
         self.worker.start()
         self.start_button.configure(text="Stop")
         self.pause_button.configure(state="normal", text="Pause")
@@ -604,33 +717,88 @@ class App(ctk.CTk):
     def _on_result(self, msg: dict) -> None:
         n_hands: int = msg["hands"]
         pred: Optional[Prediction] = msg["pred"]
-        self._set_label(self.fps_label, "fps", text=f"FPS: {msg['fps']:.0f}")
-        label, conf = self.smoother.update(pred if n_hands > 0 else None)
-        now = time.monotonic()
-        
-        event = self.hold.update(label, conf, now, n_hands > 0)
+        motion_res: Optional[MotionResult] = msg.get("motion")
+        is_tracking: bool = msg.get("is_tracking", False)
 
-        self._update_detected(label, conf, pred, self.hold)
+        self._set_label(self.fps_label, "fps", text=f"FPS: {msg['fps']:.0f}")
+        now = time.monotonic()
+        practicing = self.practice is not None and self.practice_hold is not None
+
+        # 1. Dynamic movement letter recognition completed
+        if motion_res is not None and motion_res.is_completed and motion_res.label in DYNAMIC_LETTERS:
+            dynamic_letter = motion_res.label
+            conf = motion_res.confidence
+            self._update_detected(dynamic_letter, conf, None, self.hold, mode="Dynamic",
+                                  motion_status=f"Motion: Recognized {dynamic_letter} ({conf * 100:.0f}%)")
+            self._update_status(n_hands, dynamic_letter, conf)
+            if practicing:
+                self._set_label(self.practice_sign, "pr_sign", text=f"Your sign: {dynamic_letter}")
+                if self.practice.target == dynamic_letter:
+                    self._practice_success()
+            else:
+                self.text += dynamic_letter
+                self._refresh_text()
+            self.smoother.reset()
+            return
+
+        # 2. Dynamic letter motion actively in progress
+        if is_tracking:
+            if hasattr(self, "mode_badge"):
+                self._set_label(self.mode_badge, "mode_text", text="Mode: Dynamic", text_color=ACCENT)
+            if hasattr(self, "motion_status_label"):
+                self._set_label(self.motion_status_label, "motion_status", text="Motion: Tracking movement...", text_color=ACCENT)
+            self.smoother.reset()
+            self.hold_bar.set(0.5)
+            self._update_status(n_hands, None, 0.0)
+            return
+
+        # 3. Static letter recognition path
+        label, conf = self.smoother.update(pred if n_hands > 0 else None)
+        hold = self.practice_hold if practicing else self.hold
+        event = None
+        if not (practicing and now < self._practice_pause_until):
+            event = hold.update(label, conf, now, n_hands > 0)
+
+        motion_status = "Motion: Ready" if (getattr(self, "motion_recognizer", None) and self.motion_recognizer.available) else "Motion: Idle"
+        self._update_detected(label, conf, pred, hold, mode="Static", motion_status=motion_status)
         self._update_status(n_hands, label, conf)
-        
+        if practicing:
+            self._set_label(self.practice_sign, "pr_sign", text=f"Your sign: {label or '-'}")
         if event is None:
             return
-        if event.kind == "letter":
+        if practicing:
+            if event.kind == "letter":
+                self._practice_success()
+        elif event.kind == "letter":
             self.text += event.letter
             self._refresh_text()
         elif event.kind == "space":
             self.text += " "
             self._refresh_text()
 
-    def _update_detected(self, label, conf, pred, hold: HoldToAdd) -> None:
+    def _update_detected(self, label, conf, pred, hold: HoldToAdd, mode: str = "Static",
+                         motion_status: str = "Motion: Ready") -> None:
         self._set_label(self.letter_label, "letter", text=label or "-")
         self._set_label(self.conf_value, "conf_text", text=f"{conf * 100:.0f}%")
         self.conf_bar.set(conf)
-        self.hold_bar.set(hold.progress)
-        caption = "Hold (release to repeat)" if hold.blocked else "Hold"
-        self._set_label(self.hold_caption, "hold_caption", text=caption)
+        if mode == "Dynamic":
+            self.hold_bar.set(1.0)
+            self._set_label(self.hold_caption, "hold_caption", text="Completed")
+        else:
+            self.hold_bar.set(hold.progress)
+            caption = "Hold (release to repeat)" if hold.blocked else "Hold"
+            self._set_label(self.hold_caption, "hold_caption", text=caption)
+
+        if hasattr(self, "mode_badge"):
+            badge_col = GREEN if mode == "Dynamic" else ACCENT
+            self._set_label(self.mode_badge, "mode_text", text=f"Mode: {mode}", text_color=badge_col)
+        if hasattr(self, "motion_status_label"):
+            self._set_label(self.motion_status_label, "motion_status", text=motion_status, text_color=MUTED)
+
         if pred is not None and pred.top3:
             top = "   ".join(f"{c} {p * 100:.0f}%" for c, p in pred.top3)
+        elif mode == "Dynamic" and label:
+            top = f"{label} (Dynamic DTW)"
         else:
             top = "-"
         self._set_label(self.top3_label, "top3", text=f"Top 3:  {top}")
@@ -650,9 +818,15 @@ class App(ctk.CTk):
         self.smoother.reset()
         self.hold.reset()
         self.hold.set_text_state(self.text)
+        if hasattr(self, "motion_recognizer") and self.motion_recognizer is not None:
+            self.motion_recognizer.reset()
         self._set_label(self.letter_label, "letter", text="-")
         self._set_label(self.conf_value, "conf_text", text="0%")
         self._set_label(self.top3_label, "top3", text="Top 3:  -")
+        if hasattr(self, "mode_badge"):
+            self._set_label(self.mode_badge, "mode_text", text="Mode: Static", text_color=ACCENT)
+        if hasattr(self, "motion_status_label"):
+            self._set_label(self.motion_status_label, "motion_status", text="Motion: Ready", text_color=MUTED)
         self.conf_bar.set(0)
         self.hold_bar.set(0)
 
@@ -688,6 +862,61 @@ class App(ctk.CTk):
         self._set_label(self.text_note, "note", text="Copied", text_color=GREEN)
         self.after(1500, lambda: self._set_label(self.text_note, "note", text=SHORTCUT_NOTE, text_color=MUTED))
 
+    # ------------------------------------------------------------- practice
+    def toggle_practice(self) -> None:
+        if self.practice is not None:
+            self.practice = None
+            self.practice_hold = None
+            self.practice_button.configure(text="Start Practice")
+            self.skip_button.configure(state="disabled")
+            self.target_label.configure(text="-")
+            self.practice_message.configure(text="Practice stopped. Detected letters are added to the text again.",
+                                            text_color=MUTED)
+            self._set_label(self.text_note, "note", text=SHORTCUT_NOTE, text_color=MUTED)
+            self._clear_detection()
+            return
+        letters = self.matcher.classes if self.matcher.available else []
+        if not letters:
+            self.practice_message.configure(text="No letters to practise yet. Run import_dataset.py or "
+                                                 "calibrate.py first.", text_color=AMBER)
+            return
+        self.practice = PracticeSession(letters)
+        self.practice_button.configure(text="Stop Practice")
+        self.skip_button.configure(state="normal")
+        self.score_label.configure(text="Score: 0")
+        self.streak_label.configure(text="Streak: 0")
+        self.best_label.configure(text="Best streak: 0")
+        self._new_practice_target()
+        self._set_label(self.text_note, "note", text="Practice mode is on: letters are not added to the text.",
+                        text_color=MUTED)
+        self.after(0, self._clear_detection)
+
+    def _new_practice_target(self) -> None:
+        if self.practice is None:
+            return
+        target = self.practice.next_target()
+        self.practice_hold = HoldToAdd(self.settings.hold_time, self.settings.threshold, only_letter=target)
+        self.target_label.configure(text=target or "-")
+        self.practice_message.configure(text="Hold the target sign until the bar is full.", text_color=MUTED)
+        self.smoother.reset()
+
+    def _practice_success(self) -> None:
+        assert self.practice is not None
+        self.practice.succeed()
+        self.score_label.configure(text=f"Score: {self.practice.score}")
+        self.streak_label.configure(text=f"Streak: {self.practice.streak}")
+        self.best_label.configure(text=f"Best streak: {self.practice.best_streak}")
+        self.practice_message.configure(text="Correct", text_color=GREEN)
+        self._practice_pause_until = time.monotonic() + 1.2
+        self.after(1200, self._new_practice_target)
+
+    def skip_practice(self) -> None:
+        if self.practice is None:
+            return
+        self.practice.skip()
+        self.streak_label.configure(text="Streak: 0")
+        self._new_practice_target()
+
     # --------------------------------------------------------------- settings
     def open_settings(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -698,11 +927,42 @@ class App(ctk.CTk):
     def apply_settings(self) -> None:
         s = self.settings.clamp()
         self.smoother.resize(s.smoothing)
-        if self.hold is not None:
-            self.hold.hold_time, self.hold.threshold = s.hold_time, s.threshold
+        for h in (self.hold, self.practice_hold):
+            if h is not None:
+                h.hold_time, h.threshold = s.hold_time, s.threshold
         self.hold.auto_space, self.hold.auto_space_delay = s.auto_space, s.auto_space_delay
-        self.matcher.reject_distance = s.max_distance
+        if hasattr(self.matcher, "reject_distance"):
+            self.matcher.reject_distance = s.max_distance
         s.save(SETTINGS_PATH)
+
+    # ------------------------------------------------------------------ chart
+    def _fit_chart(self) -> None:
+        if self._chart_pil is None:
+            return
+        box_w, box_h = self.chart_box.winfo_width(), self.chart_box.winfo_height()
+        if box_w < 50 or box_h < 50:
+            return
+        iw, ih = self._chart_pil.size
+        scale = min(box_w / iw, box_h / ih)
+        size = (max(1, int(iw * scale)), max(1, int(ih * scale)))
+        if self._cache.get("chart_size") == size:
+            return
+        self._cache["chart_size"] = size
+        self._chart_image = ctk.CTkImage(light_image=self._chart_pil, size=size)
+        self.chart_label.configure(image=self._chart_image)
+
+    def open_chart_large(self) -> None:
+        if self._chart_pil is None:
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("Reference Chart")
+        win.configure(fg_color=BG)
+        iw, ih = self._chart_pil.size
+        scale = min(1000 / iw, (self.winfo_screenheight() - 160) / ih)
+        size = (int(iw * scale), int(ih * scale))
+        win._image = ctk.CTkImage(light_image=self._chart_pil, size=size)   # keep a reference
+        ctk.CTkLabel(win, text="", image=win._image).pack(padx=10, pady=10)
+        win.after(100, win.lift)
 
     # ------------------------------------------------------------------ close
     def _on_close(self) -> None:
