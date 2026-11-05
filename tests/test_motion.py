@@ -335,7 +335,7 @@ def test_missing_or_empty_templates(tmp_path):
     # Recognizer initialized without templates
     rec = MotionRecognizer.from_files(paths=[empty_file], include_canonical=False)
     assert not rec.available
-    assert rec.templates == {"H": [], "J": []}
+    assert rec.templates == {"H": [], "J": [], "NONE" : []}
 
     # Running with no templates reports status safely without crashing
     h0 = make_mock_hand((0.4, 0.5, 0.0))

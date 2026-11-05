@@ -27,13 +27,15 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from motion import (DYNAMIC_LETTERS, FEATURE_DIM, MOTION_TEMPLATES, N_RESAMPLE_POINTS,
-                    compute_palm_frame, extract_motion_features, identify_hands,
-                    load_motion_templates, resample_trajectory, save_motion_templates)
+from motion import (DYNAMIC_LETTERS, FEATURE_DIM, MOTION_TEMPLATES, NEGATIVE_LABEL,
+                    N_RESAMPLE_POINTS, compute_palm_frame, extract_motion_features,
+                    identify_hands, load_motion_templates, resample_trajectory,
+                    save_motion_templates)
 from utils import HandTracker, open_camera
 
 WINDOW = "BSL Dynamic Gesture Recorder"
 COUNTDOWN_SECONDS = 3
+ALL_LABELS = DYNAMIC_LETTERS + [NEGATIVE_LABEL]
 
 INSTRUCTIONS = {
     "H": (
@@ -47,6 +49,12 @@ INSTRUCTIONS = {
         "1. Open non-dominant hand flat, palm facing up.",
         "2. Touch dominant index finger to tip of middle finger.",
         "3. Trace down the middle finger into palm and curve toward thumb.",
+    ),
+    "NONE": (
+        "Letter NONE (ordinary movement, NOT H or J):",
+        "1. Sign a normal static letter such as C, A or B.",
+        "2. Move to the next letter the way you do when spelling a word.",
+        "3. Vary it: C to A, A to B, B to C, A to E, E to I, and so on.",
     ),
 }
 
@@ -103,6 +111,23 @@ def draw_hud(frame: np.ndarray, letter: str, state: str, sample_idx: int, total_
         put_text(frame, message, (24, h - 22), 0.7, (255, 255, 255), 2)
 
 
+def _save_accepted_take(saved_data: Dict[str, List[np.ndarray]], letter: str,
+                        trajectory: np.ndarray, append: bool,
+                        replaced_letters: set[str], path: Path = MOTION_TEMPLATES) -> int:
+    if not append and letter not in replaced_letters:
+        saved_data[letter] = []
+        replaced_letters.add(letter)
+    saved_data[letter].append(trajectory)
+
+    all_trajectories, all_labels = [], []
+    for label, trajectories in saved_data.items():
+        for item in trajectories:
+            all_trajectories.append(item)
+            all_labels.append(label)
+    save_motion_templates(path, all_trajectories, all_labels)
+    return len(saved_data[letter])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--letters", nargs="+", default=DYNAMIC_LETTERS,
@@ -115,13 +140,13 @@ def main() -> None:
                         help="keep existing recorded samples instead of replacing")
     args = parser.parse_args()
 
-    letters = [c.upper() for c in args.letters if c.upper() in DYNAMIC_LETTERS]
+    letters = [c.upper() for c in args.letters if c.upper() in ALL_LABELS]
     if not letters:
         letters = DYNAMIC_LETTERS
 
     # Load existing recordings
     existing_trajs, existing_labels = load_motion_templates(MOTION_TEMPLATES)
-    saved_data: Dict[str, List[np.ndarray]] = {c: [] for c in DYNAMIC_LETTERS}
+    saved_data: Dict[str, List[np.ndarray]] = {c: [] for c in ALL_LABELS}
     for t, l in zip(existing_trajs, existing_labels):
         if l in saved_data:
             saved_data[l].append(t)
@@ -129,7 +154,7 @@ def main() -> None:
     print(f"\nBSL Dynamic Movement Recorder")
     print(f"Target letters: {letters}")
     print(f"Samples per letter: {args.samples}")
-    print(f"Current saved samples: { {c: len(saved_data[c]) for c in DYNAMIC_LETTERS} }\n")
+    print(f"Current saved samples: { {c: len(saved_data[c]) for c in ALL_LABELS} }\n")
 
     cap = open_camera(args.camera)
     if not cap.isOpened():
@@ -149,6 +174,8 @@ def main() -> None:
     recorded_features: List[np.ndarray] = []
     trail_points: List[Tuple[int, int]] = []
     review_candidate: Optional[np.ndarray] = None
+    smooth_pt = None
+    replaced_letters = set()
 
     try:
         while True:
@@ -170,16 +197,15 @@ def main() -> None:
             if len(hands) >= 2:
                 try:
                     moving, supporting, _, _ = identify_hands(hands)
-                    # Convert moving index tip to mirrored pixel coordinates
-                    idx_pt = moving[8]
-                    px = int((1.0 - idx_pt[0]) * w)
-                    py = int(idx_pt[1] * h)
-                    fingertip_px = (px, py)
+                    pt = np.array([(1.0 - moving[8][0]) * w, moving[8][1] * h], dtype=np.float32)
+                    smooth_pt = pt if smooth_pt is None else 0.6 * smooth_pt + 0.4 * pt
+                    fingertip_px = (int(smooth_pt[0]), int(smooth_pt[1]))
                 except Exception:
                     pass
 
             # State Machine
             if state == "COUNTDOWN":
+                smooth_pt = None
                 left = COUNTDOWN_SECONDS - int(now - t_state_start)
                 if left <= 0:
                     state = "RECORDING"
@@ -256,19 +282,10 @@ def main() -> None:
             elif state == "REVIEW":
                 if key in (ord("a"), ord("A"), 32):  # Accept
                     if review_candidate is not None:
-                        if not args.append and sample_count == 0:
-                            saved_data[letter] = []
-                        saved_data[letter].append(review_candidate)
-
-                        # Save to disk immediately
-                        all_t, all_l = [], []
-                        for l_key, trajs in saved_data.items():
-                            for tr in trajs:
-                                all_t.append(tr)
-                                all_l.append(l_key)
-                        save_motion_templates(MOTION_TEMPLATES, all_t, all_l)
-
-                        sample_count = len(saved_data[letter])
+                        sample_count = _save_accepted_take(
+                            saved_data, letter, review_candidate, args.append,
+                            replaced_letters
+                        )
                         message = f"Saved take #{sample_count} for {letter}!"
                         trail_points.clear()
                         review_candidate = None
@@ -289,7 +306,7 @@ def main() -> None:
         tracker.close()
         cv2.destroyAllWindows()
 
-    total_counts = {c: len(saved_data[c]) for c in DYNAMIC_LETTERS}
+    total_counts = {c: len(saved_data[c]) for c in ALL_LABELS}
     print(f"\nRecording session finished. Motion templates stored in: {MOTION_TEMPLATES}")
     print(f"Recorded samples per letter: {total_counts}")
 

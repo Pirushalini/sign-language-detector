@@ -30,8 +30,9 @@ PINKY_TIP = 20
 DYNAMIC_LETTERS = ["H", "J"]
 N_RESAMPLE_POINTS = 30
 FEATURE_DIM = 7  # [x8, y8, z8, x0, y0, z0, dist_middle_tip]
-
-
+USE_PATH_VALIDATION = False
+AMBIGUITY_RATIO = 1.5   # runner-up must be at least 10% worse than the winner
+NEGATIVE_LABEL = "NONE"
 @dataclass
 class MotionResult:
     """Result of motion recognition for a frame or completed sequence."""
@@ -97,27 +98,19 @@ def transform_point_to_palm(point: np.ndarray, origin: np.ndarray,
     z_rel = float(np.dot(diff, u_z)) / scale
     return np.array([x_rel, y_rel, z_rel], dtype=np.float32)
 
+# The signer's LEFT hand is the base (supporting) hand. In the raw, un-mirrored
+# camera frame that hand has the LARGER wrist x. Set to False for a left-handed signer.
+SUPPORTING_IS_IMAGE_RIGHT = True
 
-def identify_hands(hands: Sequence[np.ndarray],
-                   recent_speeds: Optional[Sequence[float]] = None) -> Tuple[np.ndarray, np.ndarray, int, int]:
-    """Identify moving hand (dominant) vs supporting hand (non-dominant).
-
-    Returns:
-        (moving_hand, supporting_hand, moving_idx, supporting_idx)
-    """
+def identify_hands(hands, recent_speeds=None):
     if len(hands) < 2:
         raise ValueError("At least two hands are required for dynamic BSL letter recognition.")
-
     h0 = np.asarray(hands[0], dtype=np.float32).reshape(21, 3)
     h1 = np.asarray(hands[1], dtype=np.float32).reshape(21, 3)
-
-    # 1. If recent motion speeds are available, hand with higher speed is moving
-    if recent_speeds is not None and len(recent_speeds) >= 2:
-        s0, s1 = recent_speeds[0], recent_speeds[1]
-        if s1 > s0 * 1.3:
-            return h1, h0, 1, 0
-        if s0 > s1 * 1.3:
-            return h0, h1, 0, 1
+    h0_is_right_in_image = float(h0[WRIST, 0]) > float(h1[WRIST, 0])
+    if h0_is_right_in_image == SUPPORTING_IS_IMAGE_RIGHT:   # h0 is the base hand
+        return h1, h0, 1, 0
+    return h0, h1, 0, 1
 
     # 2. Postural heuristic for BSL:
     # Supporting hand is typically an open flat palm (all 4 fingers extended).
@@ -163,14 +156,24 @@ def extract_motion_features(moving_hand: np.ndarray, supporting_hand: np.ndarray
     p_wri = transform_point_to_palm(m[WRIST], origin, u_x, u_y, u_z, scale)
 
     # Distance to supporting middle tip (critical for distinguishing 'J' from 'H')
-    dist_mid_tip = float(np.linalg.norm(m[INDEX_TIP] - s[MIDDLE_TIP])) / scale
-
+    dist_mid_tip = float(np.linalg.norm((m[INDEX_TIP] - s[MIDDLE_TIP])[:2])) / scale
+    
     feat = np.zeros(FEATURE_DIM, dtype=np.float32)
     feat[0:3] = p_idx
     feat[3:6] = p_wri
     feat[6] = dist_mid_tip
     return feat
 
+def smooth_trajectory(traj: np.ndarray, window: int = 5) -> np.ndarray:
+    """Moving average over time (edges padded) to remove landmark jitter."""
+    traj = np.asarray(traj, dtype=np.float32)
+    if len(traj) < window:
+        return traj
+    pad = window // 2
+    padded = np.pad(traj, ((pad, pad), (0, 0)), mode="edge")
+    kernel = np.ones(window, dtype=np.float32) / window
+    return np.stack([np.convolve(padded[:, d], kernel, mode="valid")
+                     for d in range(traj.shape[1])], axis=1).astype(np.float32)
 
 def resample_trajectory(trajectory: np.ndarray, target_len: int = N_RESAMPLE_POINTS) -> np.ndarray:
     """Resample trajectory to a fixed number of temporal points along its path."""
@@ -181,6 +184,7 @@ def resample_trajectory(trajectory: np.ndarray, target_len: int = N_RESAMPLE_POI
         return np.repeat(traj, target_len, axis=0)
     if len(traj) == target_len:
         return traj.copy()
+    traj = smooth_trajectory(traj)
 
     # Cumulative arc length along moving index tip (features 0:3)
     diffs = traj[1:, :3] - traj[:-1, :3]
@@ -363,7 +367,7 @@ class MotionRecognizer:
     """Real-time streaming dynamic letter recognizer using DTW."""
 
     def __init__(self,
-                 reject_distance: float = 0.85,
+                 reject_distance: float = 0.65,
                  min_path_length: float = 0.35,
                  start_speed_threshold: float = 0.35,
                  end_speed_threshold: float = 0.20,
@@ -375,8 +379,10 @@ class MotionRecognizer:
         self.end_speed_threshold = end_speed_threshold
         self.cooldown_time = cooldown_time
         self.max_missing_frames = max_missing_frames
-
-        self.templates: Dict[str, List[np.ndarray]] = {c: [] for c in DYNAMIC_LETTERS}
+        self.commit_disp = 0.12     # net fingertip travel (palm-lengths) before a gesture counts
+        self._max_disp = 0.0
+        self.enabled = True
+        self.templates: Dict[str, List[np.ndarray]] = {c: [] for c in DYNAMIC_LETTERS + [NEGATIVE_LABEL]}        
         self.state = "IDLE"  # "IDLE", "TRACKING", "COOLDOWN"
         self._raw_buffer: List[np.ndarray] = []
         self._timestamps: List[float] = []
@@ -397,8 +403,8 @@ class MotionRecognizer:
 
     @property
     def is_tracking(self) -> bool:
-        """True if a dynamic gesture is actively being traced."""
-        return self.state == "TRACKING"
+        """True only once the hand has clearly started a real movement."""
+        return self.state == "TRACKING" and self._max_disp >= self.commit_disp
 
     @classmethod
     def from_files(cls, paths: Optional[Sequence[Path]] = None,
@@ -441,6 +447,7 @@ class MotionRecognizer:
         self._recent_speeds.clear()
         self._last_feat = None
         self._last_timestamp = None
+        self._max_disp = 0.0
 
     def process_frame(self, hands: Sequence[np.ndarray], timestamp: float) -> MotionResult:
         """Process one incoming video frame with hand landmarks.
@@ -477,23 +484,15 @@ class MotionRecognizer:
         h0 = np.asarray(hands[0], dtype=np.float32).reshape(21, 3)
         h1 = np.asarray(hands[1], dtype=np.float32).reshape(21, 3)
 
-        # Estimate instantaneous speeds
-        s0, s1 = 0.0, 0.0
-        if self._last_moving_hand is not None and self._last_supporting_hand is not None:
-            # Match to previous hands by wrist distance
-            d00 = np.linalg.norm(h0[WRIST] - self._last_moving_hand[WRIST])
-            d11 = np.linalg.norm(h1[WRIST] - self._last_supporting_hand[WRIST])
-            d01 = np.linalg.norm(h0[WRIST] - self._last_supporting_hand[WRIST])
-            d10 = np.linalg.norm(h1[WRIST] - self._last_moving_hand[WRIST])
-            if (d01 + d10) < (d00 + d11):
-                h0, h1 = h1, h0
-
-        # Hand identity assignment
-        if self.state == "TRACKING" and self._moving_idx is not None:
-            moving, supporting = (h0, h1) if self._moving_idx == 0 else (h1, h0)
+        if self.state == "TRACKING" and self._last_moving_hand is not None:
+            # keep each hand's identity by nearest wrist
+            straight = (np.linalg.norm(h0[WRIST] - self._last_moving_hand[WRIST]) +
+                        np.linalg.norm(h1[WRIST] - self._last_supporting_hand[WRIST]))
+            swapped = (np.linalg.norm(h1[WRIST] - self._last_moving_hand[WRIST]) +
+                       np.linalg.norm(h0[WRIST] - self._last_supporting_hand[WRIST]))
+            moving, supporting = (h0, h1) if straight <= swapped else (h1, h0)
         else:
-            moving, supporting, m_idx, _ = identify_hands([h0, h1])
-            self._moving_idx = m_idx
+            moving, supporting, _, _ = identify_hands([h0, h1])
 
         self._last_moving_hand = moving.copy()
         self._last_supporting_hand = supporting.copy()
@@ -530,6 +529,11 @@ class MotionRecognizer:
             self._last_feat = feat.copy()
             self._last_timestamp = now
             duration = now - self._timestamps[0]
+            self._max_disp = max(self._max_disp,
+                                 float(np.linalg.norm(feat[:3] - self._raw_buffer[0][:3])))
+            if self._max_disp < self.commit_disp and duration > 0.5:
+                self.reset()                    # just jitter or a small shift: give up quietly
+                return MotionResult(status="idle")
 
             # Check if gesture reached max duration
             if duration > 1.8:
@@ -554,6 +558,7 @@ class MotionRecognizer:
     def _finalize_or_abort(self, now: float) -> MotionResult:
         """Finalize accumulated motion sequence, classify via DTW, or reject."""
         if len(self._raw_buffer) < 5:
+            print(f"[motion] too short: {len(self._raw_buffer)} frames")
             self.reset()
             return MotionResult(status="rejected")
 
@@ -563,6 +568,7 @@ class MotionRecognizer:
         total_path = float(np.sum(np.linalg.norm(diffs, axis=1)))
 
         if total_path < self.min_path_length:
+            print(f"[motion] too small: path={total_path:.2f}")
             self.reset()
             return MotionResult(status="rejected", distance=999.0)
 
@@ -588,17 +594,31 @@ class MotionRecognizer:
                 best_dist = min_d
                 best_letter = letter
 
+        if best_letter == NEGATIVE_LABEL:
+            print(f"[motion] normal transition (NONE wins): {scores}")
+            self.reset()
+            return MotionResult(status="rejected", distance=best_dist, details=scores)
+
         # Check rejection threshold
         if best_letter is None or best_dist > self.reject_distance:
             self.reset()
             return MotionResult(status="rejected", distance=best_dist, details=scores)
 
-        # Biomechanical direction validation
-        valid, reason = validate_gesture_path(best_letter, candidate)
-        if not valid:
+        others = [d for l, d in scores.items() if l not in (best_letter, NEGATIVE_LABEL)]
+        if others and min(others) < best_dist * AMBIGUITY_RATIO:
+            print(f"[motion] ambiguous: {scores}")
             self.reset()
-            return MotionResult(status="rejected", distance=best_dist, details={"validation_error": 1.0})
-
+            return MotionResult(status="rejected", distance=best_dist, details=scores)
+        
+        # Biomechanical direction validation
+        if USE_PATH_VALIDATION:
+            valid, reason = validate_gesture_path(best_letter, candidate)
+            if not valid:
+                print(f"[motion] path check failed: {reason}")
+                self.reset()
+                return MotionResult(status="rejected", distance=best_dist,
+                                    details={**scores, "validation_error": 1.0})
+            
         # Recognized successfully
         confidence = float(np.clip(1.0 - (best_dist / max(self.reject_distance, 1e-6)), 0.5, 0.99))
         self._last_recognized_letter = best_letter

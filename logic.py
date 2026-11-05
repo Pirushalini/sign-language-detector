@@ -30,7 +30,7 @@ class Settings:
     camera_index: int = 0
     backend: str = "template"       # "template" or "ml"
     ml_model: str = "svm_ext"       # saved model identifier in models/
-
+        
     RANGES = {
         "hold_time": (0.3, 2.5), "threshold": (0.5, 0.99), "smoothing": (1, 15),
         "max_distance": (0.5, 3.0), "auto_space_delay": (1.0, 5.0), "camera_index": (0, 9),
@@ -196,6 +196,11 @@ class HoldToAdd:
                 self._space_done = True
                 self._can_space = False
         return event
+
+    
+    def block(self, label: Optional[str]) -> None:
+        """Ignore this letter until a different sign is shown or the hands are released."""
+        self._last_added = label
 
 
 # ------------------------------------------------------------------ practice

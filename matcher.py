@@ -13,8 +13,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from utils import (EXTERNAL_TEMPLATES, FEATURE_LEN, FLAGS_START, INTER_START,
-                   USER_TEMPLATES)
+from utils import (EXTERNAL_TEMPLATES, FEATURE_LEN, FLAGS_START, HAND_LEN,
+                   INTER_START, ONE_HAND_LETTERS, USER_TEMPLATES)
 
 SRC_EXTERNAL = 0
 SRC_USER = 1
@@ -28,6 +28,27 @@ class Prediction:
     confidence: float
     top3: List[Tuple[str, float]] = field(default_factory=list)
     distance: float = float("inf")
+
+
+TIP_IDX = [4, 8, 12, 16, 20]      # thumb, index, middle, ring, pinky tips
+
+
+def relation_features(X: np.ndarray) -> np.ndarray:
+    """Fingertip-to-fingertip distances between the two hands, 25 values per row.
+
+    Recovered from the stored 132 features, so no template needs re-recording.
+    Only x and y are used: MediaPipe's z is measured from each hand's own wrist
+    and cannot be compared between hands. Rows without two hands get zeros.
+    """
+    X = np.atleast_2d(np.asarray(X, dtype=np.float32))
+    a = X[:, :HAND_LEN].reshape(-1, 21, 3)[:, TIP_IDX, :2]                  # hand 1 tips
+    b = X[:, HAND_LEN:2 * HAND_LEN].reshape(-1, 21, 3)[:, TIP_IDX, :2]      # hand 2 tips
+    delta = X[:, INTER_START:INTER_START + 2]                               # wrist2 - wrist1
+    a_in_b = a - delta[:, None, :]                                          # hand 1 tips, seen from hand 2's wrist
+    d = np.linalg.norm(a_in_b[:, :, None, :] - b[:, None, :, :], axis=-1).reshape(len(X), -1)
+    two = (X[:, FLAGS_START] > 0.5) & (X[:, FLAGS_START + 1] > 0.5)
+    d[~two] = 0.0
+    return d.astype(np.float32)
 
 
 # ------------------------------------------------------------ file helpers
@@ -64,11 +85,16 @@ class TemplateMatcher:
                    (below 1 means your own samples are preferred)
     temperature:   turns letter scores into probabilities (smaller = sharper)
     reject_distance: if the best score is above this, nothing is returned
+    rel_weight:    weight of the fingertip-to-fingertip distances between the two
+                   hands (0 = off). Helps with letters that differ only in which
+                   finger is touched. Distances grow when it is on, so the
+                   reject distance may need raising.
     """
 
     def __init__(self, k: int = 3, metric: str = "euclidean", inter_weight: float = 2.0,
                  flag_weight: float = 3.0, user_weight: float = 0.85,
-                 temperature: float = 0.12, reject_distance: float = 1.5):
+                 temperature: float = 0.12, reject_distance: float = 1.5,
+                 rel_weight: float = 0.0):
         self.k = k
         self.metric = metric
         self.inter_weight = inter_weight
@@ -76,6 +102,7 @@ class TemplateMatcher:
         self.user_weight = user_weight
         self.temperature = temperature
         self.reject_distance = reject_distance
+        self.rel_weight = rel_weight
         self.X = np.zeros((0, FEATURE_LEN), dtype=np.float32)
         self.y = np.array([], dtype="<U8")
         self.src = np.array([], dtype=np.int8)
@@ -83,7 +110,8 @@ class TemplateMatcher:
 
     # ----------------------------------------------------------- loading
     @classmethod
-    def from_files(cls, paths: Optional[Iterable[Path]] = None, **kwargs) -> "TemplateMatcher":
+    def from_files(cls, paths: Optional[Iterable[Path]] = None,
+                   require_two_hands: bool = True, **kwargs) -> "TemplateMatcher":
         """Load every template file that exists (external dataset and/or your own)."""
         m = cls(**kwargs)
         for p in (paths if paths is not None else [EXTERNAL_TEMPLATES, USER_TEMPLATES]):
@@ -93,6 +121,13 @@ class TemplateMatcher:
                 if X.shape[1] != FEATURE_LEN:
                     raise ValueError(f"{p.name} has {X.shape[1]} features, expected {FEATURE_LEN}. "
                                      "Re-run import_dataset.py / calibrate.py.")
+                if require_two_hands:
+                    n_hands = (X[:, FLAGS_START] > 0.5).astype(int) + (
+                        X[:, FLAGS_START + 1] > 0.5
+                    )
+                    is_one = np.isin(y, list(ONE_HAND_LETTERS))
+                    keep = np.where(is_one, n_hands == 1, n_hands == 2)
+                    X, y, src = X[keep], y[keep], src[keep]
                 m.add(X, y, src)
         return m
 
@@ -132,7 +167,7 @@ class TemplateMatcher:
         w[INTER_START:FLAGS_START] = self.inter_weight
         w[FLAGS_START:] = self.flag_weight
         self._sqrt_w = np.sqrt(w)
-        Xw = self.X * self._sqrt_w
+        Xw = self._embed(self.X)
         if self.metric == "cosine":
             norms = np.linalg.norm(Xw, axis=1, keepdims=True)
             Xw = Xw / np.maximum(norms, 1e-9)
@@ -143,9 +178,16 @@ class TemplateMatcher:
         self._class_idx = [np.flatnonzero(self.y == c) for c in self._classes]
         self._dirty = False
 
+    def _embed(self, Q: np.ndarray) -> np.ndarray:
+        """Weighted feature vectors (plus the hand-to-hand distances when rel_weight > 0)."""
+        Qw = Q * self._sqrt_w
+        if self.rel_weight > 0:
+            Qw = np.hstack([Qw, relation_features(Q) * np.float32(np.sqrt(self.rel_weight))])
+        return Qw
+
     def _distances(self, Q: np.ndarray) -> np.ndarray:
         """Distances from each query row to every template, shape (M, N)."""
-        Qw = Q * self._sqrt_w
+        Qw = self._embed(Q)
         if self.metric == "cosine":
             Qw = Qw / np.maximum(np.linalg.norm(Qw, axis=1, keepdims=True), 1e-9)
             D = 1.0 - Qw @ self._Xw.T
