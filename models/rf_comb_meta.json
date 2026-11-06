@@ -1,0 +1,42 @@
+{
+  "name": "rf_comb",
+  "data_source": "combined",
+  "classes": [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z"
+  ],
+  "hyperparameters": {
+    "clf__n_estimators": 200,
+    "clf__max_depth": null,
+    "clf__min_samples_leaf": 1
+  },
+  "feature_dim": 132,
+  "sklearn_pipeline_steps": [
+    "scaler",
+    "clf"
+  ]
+}

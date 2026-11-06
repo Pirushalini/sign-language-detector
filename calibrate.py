@@ -22,8 +22,9 @@ import cv2
 import numpy as np
 
 from matcher import SRC_USER, load_templates, save_templates
-from utils import (CHART_PATH, FEATURE_LEN, LETTERS, USER_TEMPLATES, HandTracker,
-                   build_features, chart_cell, open_camera)
+from utils import (CHART_PATH, FEATURE_LEN, LETTERS, ONE_HAND_LETTERS,
+                   USER_TEMPLATES, HandTracker, build_features, chart_cell,
+                   open_camera)
 
 WINDOW = "Calibration"
 CHART_WINDOW = "Reference chart"
@@ -151,7 +152,8 @@ def main() -> None:
                     cv2.putText(view, str(left), (w // 2 - 40, h // 2 + 50), cv2.FONT_HERSHEY_SIMPLEX,
                                 5, (255, 255, 255), 10, cv2.LINE_AA)
             elif state == "recording":
-                if hands and now - t_last_sample >= args.interval:
+                need = 1 if letter in ONE_HAND_LETTERS else 2
+                if len(hands) == need and now - t_last_sample >= args.interval:
                     buffer.append(build_features(hands, aspect=w / h))
                     t_last_sample = now
                 if len(buffer) >= args.samples:

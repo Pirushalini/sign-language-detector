@@ -129,6 +129,24 @@ def test_wrong_feature_length_gives_clear_error(tmp_path):
         TemplateMatcher.from_files([path])
 
 
+def test_from_files_filters_templates_by_expected_hand_count(tmp_path):
+    one_hand = build_features([random_hand()])
+    two_hands = build_features([random_hand(), random_hand()])
+    path = tmp_path / "hand_counts.npz"
+    save_templates(
+        path,
+        np.stack([one_hand, two_hands, one_hand, two_hands]),
+        ["C", "C", "A", "A"],
+        [SRC_EXTERNAL] * 4,
+    )
+
+    filtered = TemplateMatcher.from_files([path])
+    assert list(filtered.y) == ["C", "A"]
+
+    unfiltered = TemplateMatcher.from_files([path], require_two_hands=False)
+    assert len(unfiltered.y) == 4
+
+
 # ------------------------------------------------------- smoothing / hold logic
 def pred(label, conf=0.95):
     return Prediction(label, conf if label else 0.0)

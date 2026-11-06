@@ -27,6 +27,7 @@ USER_TEMPLATES = DATA_DIR / "templates_user.npz"
 # -------------------------------------------------------------- classes
 LETTERS: List[str] = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 IDLE = "idle"
+ONE_HAND_LETTERS = {"C"}      # letters signed with a single hand; every other letter needs two
 
 # -------------------------------------------------------------- features
 N_LANDMARKS = 21
