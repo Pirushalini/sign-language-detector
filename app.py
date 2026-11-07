@@ -163,8 +163,12 @@ class DetectorWorker(threading.Thread):
                 if hands and self.matcher.available and not is_tracking:
                     pred = self.matcher.predict(build_features(hands, aspect=w / h))
                     if len(hands) == 1 and pred.label is not None:
-                        if pred.label not in ONE_HAND_LETTERS or pred.distance > ONE_HAND_MAX_DISTANCE:
-                            pred = None
+                        if pred.label not in ONE_HAND_LETTERS:
+                            pred = Prediction(None, 0.0, pred.top3, pred.distance,
+                                              rejection_reason="Single hand shown for two-handed letter")
+                        elif pred.distance > ONE_HAND_MAX_DISTANCE:
+                            pred = Prediction(None, 0.0, pred.top3, pred.distance,
+                                              rejection_reason=f"Single-hand distance {pred.distance:.2f} > max {ONE_HAND_MAX_DISTANCE:.2f}")
 
                 if self.settings.show_landmarks:
                     tracker.draw(frame, result)
@@ -352,7 +356,7 @@ class App(ctk.CTk):
                 pass  # Fall back to template matching on any load error
 
         try:
-            matcher = TemplateMatcher.from_files(reject_distance=self.settings.max_distance,inter_weight=6.0, rel_weight=10.0)
+            matcher = TemplateMatcher.from_files(reject_distance=self.settings.max_distance, inter_weight=2.0, rel_weight=0.0)
         except ValueError as exc:
             return TemplateMatcher(), str(exc)
         if not matcher.available:
@@ -716,6 +720,15 @@ class App(ctk.CTk):
             self._update_status(n_hands, self._last_motion[0], self._last_motion[1])
             return
 
+        # Diagnostic log on state change
+        if pred is not None:
+            pred_key = f"{pred.label}:{getattr(pred, 'rejection_reason', None)}"
+            if pred_key != getattr(self, "_last_logged_pred", None):
+                self._last_logged_pred = pred_key
+                if pred.label is not None:
+                    print(f"[predict] letter={pred.label} conf={pred.confidence * 100:.0f}% dist={pred.distance:.2f} top3={pred.top3}")
+                elif getattr(pred, "rejection_reason", None):
+                    print(f"[predict] rejected: {pred.rejection_reason} dist={pred.distance:.2f} top3={pred.top3}")
 
         # 3. Static letters
         event = self.hold.update(label, conf, now, n_hands > 0)
@@ -752,6 +765,8 @@ class App(ctk.CTk):
 
         if pred is not None and pred.top3:
             top = "   ".join(f"{c} {p * 100:.0f}%" for c, p in pred.top3)
+            if pred.label is None and getattr(pred, "rejection_reason", None):
+                top += f" [{pred.rejection_reason}]"
         elif mode == "Dynamic" and label:
             top = f"{label} (Dynamic DTW)"
         else:

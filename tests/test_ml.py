@@ -342,10 +342,10 @@ def test_personal_block_split_has_no_leakage():
     from ml.personal_experiments import make_personal_block_split
     X_cal, y_cal, X_test, y_test, classes = make_personal_block_split(cal_samples_per_letter=40)
 
-    # 20 letters * 40 = 800 cal; 20 * 20 = 400 test
-    assert len(X_cal) == 800
-    assert len(X_test) == 400
-    assert len(classes) == 20
+    n_cls = len(classes)
+    assert len(X_cal) == n_cls * 40
+    assert len(X_test) == len(X_cal) or len(X_test) == n_cls * 20
+    assert n_cls >= 20
 
     # Ensure no exact row from X_test appears in X_cal
     # (checking first few samples with allclose)

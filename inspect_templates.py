@@ -1,8 +1,13 @@
+import csv
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 
 # --------------------------------------------------
@@ -305,20 +310,35 @@ for letter in letters:
 # Save report
 # --------------------------------------------------
 
-report = pd.DataFrame(rows)
-
-report.to_csv(
-    OUTPUT_DIR / "template_comparison.csv",
-    index=False
-)
-
-print("\nTemplate comparison report:")
-print(
-    report.to_string(
-        index=False,
-        float_format=lambda x: f"{x:.4f}"
+if pd is not None:
+    report = pd.DataFrame(rows)
+    report.to_csv(
+        OUTPUT_DIR / "template_comparison.csv",
+        index=False
     )
-)
+    print("\nTemplate comparison report:")
+    print(
+        report.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.4f}"
+        )
+    )
+else:
+    out_csv = OUTPUT_DIR / "template_comparison.csv"
+    if rows:
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+    print("\nTemplate comparison report:")
+    if rows:
+        cols = list(rows[0].keys())
+        widths = {c: max(len(c), max(len(f"{r.get(c, ''):.4f}" if isinstance(r.get(c), float) else str(r.get(c, ''))) for r in rows)) for c in cols}
+        header_str = "  ".join(c.ljust(widths[c]) for c in cols)
+        print(header_str)
+        print("-" * len(header_str))
+        for r in rows:
+            print("  ".join((f"{r[c]:.4f}" if isinstance(r[c], float) else str(r[c])).ljust(widths[c]) for c in cols))
 
 print(f"\nCSV saved to: {OUTPUT_DIR / 'template_comparison.csv'}")
 print(f"Plots saved to: {PLOT_DIR.resolve()}")

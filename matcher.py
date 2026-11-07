@@ -28,6 +28,7 @@ class Prediction:
     confidence: float
     top3: List[Tuple[str, float]] = field(default_factory=list)
     distance: float = float("inf")
+    rejection_reason: Optional[str] = None
 
 
 TIP_IDX = [4, 8, 12, 16, 20]      # thumb, index, middle, ring, pinky tips
@@ -49,6 +50,30 @@ def relation_features(X: np.ndarray) -> np.ndarray:
     two = (X[:, FLAGS_START] > 0.5) & (X[:, FLAGS_START + 1] > 0.5)
     d[~two] = 0.0
     return d.astype(np.float32)
+
+
+def swap_two_hands(X: np.ndarray) -> np.ndarray:
+    """Swap Hand 1 and Hand 2 features for two-handed feature vectors.
+
+    Swaps hand landmarks [0:63] with [63:126], negates the inter-wrist vector [126:129],
+    keeps wrist distance [129] identical, and swaps presence flags [130] and [131].
+    Single-hand vectors are left unchanged.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    was_1d = (X.ndim == 1)
+    out = np.atleast_2d(X).copy()
+    two = (out[:, FLAGS_START] > 0.5) & (out[:, FLAGS_START + 1] > 0.5)
+    if np.any(two):
+        h1 = out[two, :HAND_LEN].copy()
+        h2 = out[two, HAND_LEN:2 * HAND_LEN].copy()
+        out[two, :HAND_LEN] = h2
+        out[two, HAND_LEN:2 * HAND_LEN] = h1
+        out[two, INTER_START:INTER_START + 3] = -out[two, INTER_START:INTER_START + 3]
+        f1 = out[two, FLAGS_START].copy()
+        f2 = out[two, FLAGS_START + 1].copy()
+        out[two, FLAGS_START] = f2
+        out[two, FLAGS_START + 1] = f1
+    return out[0] if was_1d else out
 
 
 # ------------------------------------------------------------ file helpers
@@ -94,16 +119,20 @@ class TemplateMatcher:
     """
 
     def __init__(self, k: int = 3, metric: str = "euclidean", inter_weight: float = 2.0,
+                 rel_weight: float = 0.0,
                  flag_weight: float = 3.0, user_weight: float = 0.85,
                  temperature: float = 0.12, reject_distance: float = 1.5,
+                 dual_order: bool = True,
                  feature_weights: Optional[np.ndarray] = None, n_features: int = FEATURE_LEN):
         self.k = k
         self.metric = metric
         self.inter_weight = inter_weight
+        self.rel_weight = rel_weight
         self.flag_weight = flag_weight
         self.user_weight = user_weight
         self.temperature = temperature
         self.reject_distance = reject_distance
+        self.dual_order = dual_order
         self.feature_weights = feature_weights
         self.X = np.zeros((0, n_features), dtype=np.float32)
         self.y = np.array([], dtype="<U8")
@@ -195,6 +224,7 @@ class TemplateMatcher:
 
     def _distances(self, Q: np.ndarray) -> np.ndarray:
         """Distances from each query row to every template, shape (M, N)."""
+        Q = np.atleast_2d(np.asarray(Q, dtype=np.float32))
         Qw = self._embed(Q)
         if self.metric == "cosine":
             Qw = Qw / np.maximum(np.linalg.norm(Qw, axis=1, keepdims=True), 1e-9)
@@ -202,6 +232,20 @@ class TemplateMatcher:
         else:
             d2 = np.sum(Qw * Qw, axis=1, keepdims=True) - 2.0 * (Qw @ self._Xw.T) + self._sq_norm[None, :]
             D = np.sqrt(np.maximum(d2, 0.0))
+
+        if self.dual_order:
+            two = (Q[:, FLAGS_START] > 0.5) & (Q[:, FLAGS_START + 1] > 0.5)
+            if np.any(two):
+                Q_swap = swap_two_hands(Q[two])
+                Qw_swap = self._embed(Q_swap)
+                if self.metric == "cosine":
+                    Qw_swap = Qw_swap / np.maximum(np.linalg.norm(Qw_swap, axis=1, keepdims=True), 1e-9)
+                    D_swap = 1.0 - Qw_swap @ self._Xw.T
+                else:
+                    d2_swap = np.sum(Qw_swap * Qw_swap, axis=1, keepdims=True) - 2.0 * (Qw_swap @ self._Xw.T) + self._sq_norm[None, :]
+                    D_swap = np.sqrt(np.maximum(d2_swap, 0.0))
+                D[two] = np.minimum(D[two], D_swap)
+
         return D * self._scale[None, :]
 
     def class_scores(self, Q: np.ndarray) -> np.ndarray:
@@ -221,7 +265,7 @@ class TemplateMatcher:
     def predict(self, feat: np.ndarray) -> Prediction:
         """Classify one feature vector."""
         if not self.available:
-            return Prediction(None, 0.0)
+            return Prediction(None, 0.0, rejection_reason="No templates available")
         if self._dirty:
             self._prepare()
         s = self.class_scores(feat)[0]
@@ -233,8 +277,9 @@ class TemplateMatcher:
         best = int(order[0])
         distance = float(s[best])
         if distance > self.reject_distance:
-            return Prediction(None, 0.0, top3, distance)
-        return Prediction(self._classes[best], float(p[best]), top3, distance)
+            return Prediction(None, 0.0, top3, distance,
+                              rejection_reason=f"Distance {distance:.2f} > max {self.reject_distance:.2f}")
+        return Prediction(self._classes[best], float(p[best]), top3, distance, rejection_reason=None)
 
     def predict_labels(self, Q: np.ndarray, chunk: int = 256) -> Tuple[np.ndarray, np.ndarray]:
         """Best letter and its score for many queries (used by evaluate.py)."""
