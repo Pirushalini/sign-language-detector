@@ -16,6 +16,7 @@ from tkinter import messagebox
 from typing import Dict, List, Optional
 
 import cv2
+# pyrefly: ignore[missing-import]
 import customtkinter as ctk
 import numpy as np
 # pyrefly: ignore[missing-import]
@@ -41,6 +42,90 @@ RED = "#DC2626"
 GRAY = "#9CA3AF"
 SHORTCUT_NOTE = "Shortcuts: Backspace erase, Space space, Esc reset"
 ONE_HAND_MAX_DISTANCE = 1.1
+
+
+def detect_io_contact(hands, aspect):
+    """Conservative raw-landmark detector for BSL I and O."""
+    if len(hands) != 2:
+        return None
+
+    prepared = []
+    for hand in hands:
+        xy = np.asarray(hand, dtype=np.float32)[:, :2].copy()
+        xy[:, 0] *= aspect
+        prepared.append(xy)
+
+    fingers = [
+        (5, 6, 7, 8),
+        (9, 10, 11, 12),
+        (13, 14, 15, 16),
+        (17, 18, 19, 20),
+    ]
+
+    def straightness(h):
+        values = []
+        for m, p, d, t in fingers:
+            path = (
+                np.linalg.norm(h[m] - h[p])
+                + np.linalg.norm(h[p] - h[d])
+                + np.linalg.norm(h[d] - h[t])
+            )
+            values.append(
+                np.linalg.norm(h[m] - h[t]) / max(path, 1e-6)
+            )
+        return np.asarray(values)
+
+    candidates = []
+
+    for pointing, support in (
+        (prepared[0], prepared[1]),
+        (prepared[1], prepared[0]),
+    ):
+        pr = straightness(pointing)
+        sr = straightness(support)
+
+        # Pointing hand: index straight, other fingers folded.
+        if pr[0] < 0.83:
+            continue
+        if np.count_nonzero(pr[1:] < 0.75) < 2:
+            continue
+
+        # Supporting hand: mostly open.
+        if np.count_nonzero(sr > 0.80) < 3:
+            continue
+
+        palm_width = max(
+            float(np.linalg.norm(support[5] - support[17])),
+            1e-6,
+        )
+
+        # Pointing index tip to the five supporting fingertips.
+        distances = np.linalg.norm(
+            support[[4, 8, 12, 16, 20]] - pointing[8],
+            axis=1,
+        ) / palm_width
+
+        nearest = int(np.argmin(distances))
+        ordered = np.sort(distances)
+
+        # I = middle finger, O = ring finger.
+        if nearest not in (2, 3):
+            continue
+
+        # Require close contact and a clear nearest fingertip.
+        if distances[nearest] > 0.35:
+            continue
+        if ordered[1] - ordered[0] < 0.14:
+            continue
+
+        label = "I" if nearest == 2 else "O"
+        candidates.append((label, float(distances[nearest])))
+
+    if len(candidates) != 1:
+        return None
+
+    return candidates[0]
+
 
 def font_family() -> Optional[str]:
     if sys.platform.startswith("win"):
@@ -162,6 +247,17 @@ class DetectorWorker(threading.Thread):
                 # If dynamic gesture is being actively tracked, suppress static predictions
                 if hands and self.matcher.available and not is_tracking:
                     pred = self.matcher.predict(build_features(hands, aspect=w / h))
+                    io_result = detect_io_contact(hands, w / h)
+
+                    if io_result is not None:
+                        io_label, contact_distance = io_result
+
+                        pred = Prediction(
+                            label=io_label,
+                            confidence=0.86,
+                            top3=[(io_label, 0.86)],
+                            distance=contact_distance,
+                        )
                     if len(hands) == 1 and pred.label is not None:
                         if pred.label not in ONE_HAND_LETTERS:
                             pred = Prediction(None, 0.0, pred.top3, pred.distance,

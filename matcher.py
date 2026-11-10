@@ -5,6 +5,7 @@ There is no training step and no fitted model. Reference feature vectors
 are, and a live frame is classified by its distance to the nearest stored
 examples of each letter. This is instance-based (non-parametric) classification.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -13,8 +14,15 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from utils import (EXTERNAL_TEMPLATES, FEATURE_LEN, FLAGS_START, HAND_LEN,
-                   INTER_START, ONE_HAND_LETTERS, USER_TEMPLATES)
+from utils import (
+    EXTERNAL_TEMPLATES,
+    FEATURE_LEN,
+    FLAGS_START,
+    HAND_LEN,
+    INTER_START,
+    ONE_HAND_LETTERS,
+    USER_TEMPLATES,
+)
 
 SRC_EXTERNAL = 0
 SRC_USER = 1
@@ -31,38 +39,37 @@ class Prediction:
     rejection_reason: Optional[str] = None
 
 
-TIP_IDX = [4, 8, 12, 16, 20]      # thumb, index, middle, ring, pinky tips
+TIP_IDX = [4, 8, 12, 16, 20]  # thumb, index, middle, ring, pinky tips
 
 
 def relation_features(X: np.ndarray) -> np.ndarray:
-    """Fingertip-to-fingertip distances between the two hands, 25 values per row.
+    """Approximate cross-hand fingertip distances, 25 values per row.
 
-    Recovered from the stored 132 features, so no template needs re-recording.
-    Only x and y are used: MediaPipe's z is measured from each hand's own wrist
-    and cannot be compared between hands. Rows without two hands get zeros.
+    Reconstructed from stored 132-D features. Because each hand was scaled
+    independently, these are NOT physically exact touch distances.
+    Only x/y are used because per-hand-relative z cannot be compared.
+    Rows without two hands get zeros.
     """
     X = np.atleast_2d(np.asarray(X, dtype=np.float32))
-    a = X[:, :HAND_LEN].reshape(-1, 21, 3)[:, TIP_IDX, :2]                  # hand 1 tips
-    b = X[:, HAND_LEN:2 * HAND_LEN].reshape(-1, 21, 3)[:, TIP_IDX, :2]      # hand 2 tips
-    delta = X[:, INTER_START:INTER_START + 2]                               # wrist2 - wrist1
-    a_in_b = a - delta[:, None, :]                                          # hand 1 tips, seen from hand 2's wrist
-    d = np.linalg.norm(a_in_b[:, :, None, :] - b[:, None, :, :], axis=-1).reshape(len(X), -1)
+    a = X[:, :HAND_LEN].reshape(-1, 21, 3)[:, TIP_IDX, :2]
+    b = X[:, HAND_LEN:2 * HAND_LEN].reshape(-1, 21, 3)[:, TIP_IDX, :2]
+    delta = X[:, INTER_START:INTER_START + 2]
+    a_in_b = a - delta[:, None, :]
+    d = np.linalg.norm(
+        a_in_b[:, :, None, :] - b[:, None, :, :], axis=-1
+    ).reshape(len(X), -1)
     two = (X[:, FLAGS_START] > 0.5) & (X[:, FLAGS_START + 1] > 0.5)
     d[~two] = 0.0
     return d.astype(np.float32)
 
 
 def swap_two_hands(X: np.ndarray) -> np.ndarray:
-    """Swap Hand 1 and Hand 2 features for two-handed feature vectors.
-
-    Swaps hand landmarks [0:63] with [63:126], negates the inter-wrist vector [126:129],
-    keeps wrist distance [129] identical, and swaps presence flags [130] and [131].
-    Single-hand vectors are left unchanged.
-    """
+    """Swap two-hand feature slots, preserving single-hand examples."""
     X = np.asarray(X, dtype=np.float32)
-    was_1d = (X.ndim == 1)
+    was_1d = X.ndim == 1
     out = np.atleast_2d(X).copy()
     two = (out[:, FLAGS_START] > 0.5) & (out[:, FLAGS_START + 1] > 0.5)
+
     if np.any(two):
         h1 = out[two, :HAND_LEN].copy()
         h2 = out[two, HAND_LEN:2 * HAND_LEN].copy()
@@ -73,12 +80,19 @@ def swap_two_hands(X: np.ndarray) -> np.ndarray:
         f2 = out[two, FLAGS_START + 1].copy()
         out[two, FLAGS_START] = f2
         out[two, FLAGS_START + 1] = f1
+
     return out[0] if was_1d else out
 
 
 # ------------------------------------------------------------ file helpers
-def save_templates(path: Path, X: np.ndarray, y: Sequence[str], src: Sequence[int],
-                   sessions: Optional[Sequence[str]] = None) -> None:
+
+def save_templates(
+    path: Path,
+    X: np.ndarray,
+    y: Sequence[str],
+    src: Sequence[int],
+    sessions: Optional[Sequence[str]] = None,
+) -> None:
     """Save reference templates to a compressed .npz file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     n = len(y)
@@ -98,32 +112,37 @@ def load_templates(path: Path):
 
 
 # ----------------------------------------------------------------- matcher
+
 class TemplateMatcher:
     """k-nearest-template matcher with per-letter scores.
 
-    k:             how many nearest templates of a letter are averaged
-    metric:        "euclidean" (default) or "cosine"
-    inter_weight:  weight of the wrist-to-wrist features (how the hands sit)
-    flag_weight:   weight of the hand-present flags, so a frame with one hand
-                   is pushed away from two-hand templates without being excluded
-    user_weight:   distances to your own templates are multiplied by this
-                   (below 1 means your own samples are preferred)
-    temperature:   turns letter scores into probabilities (smaller = sharper)
-    reject_distance: if the best score is above this, nothing is returned
-    feature_weights: optional per-feature weight vector (one value per column of X). When
-                   given it replaces inter_weight / flag_weight completely. A weight w
-                   scales the squared difference of that feature, so w = 0 switches a
-                   feature off. Used by the weighting experiments (experiments/).
-    n_features:    width of the feature vectors (default 132). Experiments may append
-                   extra columns (for example palm-side values).
+    k:                number of nearest samples per letter to average
+    metric:           'euclidean' or 'cosine'
+    inter_weight:     cross-hand wrist-position feature weight
+    rel_weight:       optional approximate 25-D cross-hand relations weight
+    flag_weight:      hand-presence flag weight
+    user_weight:      distance multiplier for personal templates
+    temperature:      softmax temperature for relative confidence
+    reject_distance:  reject if best distance exceeds this
+    dual_order:       compare both assignments of the two hands
+    feature_weights:  optional per-feature weights
+    n_features:       input feature dimension (default 132)
     """
 
-    def __init__(self, k: int = 3, metric: str = "euclidean", inter_weight: float = 2.0,
-                 rel_weight: float = 0.0,
-                 flag_weight: float = 3.0, user_weight: float = 0.85,
-                 temperature: float = 0.12, reject_distance: float = 1.5,
-                 dual_order: bool = True,
-                 feature_weights: Optional[np.ndarray] = None, n_features: int = FEATURE_LEN):
+    def __init__(
+        self,
+        k: int = 3,
+        metric: str = "euclidean",
+        inter_weight: float = 2.0,
+        rel_weight: float = 0.0,
+        flag_weight: float = 3.0,
+        user_weight: float = 0.85,
+        temperature: float = 0.12,
+        reject_distance: float = 1.5,
+        dual_order: bool = True,
+        feature_weights: Optional[np.ndarray] = None,
+        n_features: int = FEATURE_LEN,
+    ):
         self.k = k
         self.metric = metric
         self.inter_weight = inter_weight
@@ -141,20 +160,27 @@ class TemplateMatcher:
 
     # ----------------------------------------------------------- loading
     @classmethod
-    def from_files(cls, paths: Optional[Iterable[Path]] = None,
-                   require_two_hands: bool = True, **kwargs) -> "TemplateMatcher":
-        """Load every template file that exists (external dataset and/or your own)."""
+    def from_files(
+        cls,
+        paths: Optional[Iterable[Path]] = None,
+        require_two_hands: bool = True,
+        **kwargs,
+    ) -> "TemplateMatcher":
+        """Load every template file that exists (external and/or personal)."""
         m = cls(**kwargs)
         for p in (paths if paths is not None else [EXTERNAL_TEMPLATES, USER_TEMPLATES]):
             p = Path(p)
             if p.exists():
                 X, y, src, _ = load_templates(p)
                 if X.shape[1] != FEATURE_LEN:
-                    raise ValueError(f"{p.name} has {X.shape[1]} features, expected {FEATURE_LEN}. "
-                                     "Re-run import_dataset.py / calibrate.py.")
+                    raise ValueError(
+                        f"{p.name} has {X.shape[1]} features, expected {FEATURE_LEN}. "
+                        "Re-run import_dataset.py / calibrate.py."
+                    )
                 if require_two_hands:
-                    n_hands = (X[:, FLAGS_START] > 0.5).astype(int) + (
-                        X[:, FLAGS_START + 1] > 0.5
+                    n_hands = (
+                        (X[:, FLAGS_START] > 0.5).astype(int)
+                        + (X[:, FLAGS_START + 1] > 0.5).astype(int)
                     )
                     is_one = np.isin(y, list(ONE_HAND_LETTERS))
                     keep = np.where(is_one, n_hands == 1, n_hands == 2)
@@ -181,12 +207,15 @@ class TemplateMatcher:
         out = {}
         for c in self.classes:
             mask = self.y == c
-            out[c] = (int(np.sum(mask & (self.src == SRC_EXTERNAL))), int(np.sum(mask & (self.src == SRC_USER))))
+            out[c] = (
+                int(np.sum(mask & (self.src == SRC_EXTERNAL))),
+                int(np.sum(mask & (self.src == SRC_USER))),
+            )
         return out
 
     # ----------------------------------------------------------- internals
     def configure(self, **kwargs) -> None:
-        """Change matching options (k, metric, weights, ...) and rebuild caches."""
+        """Change matching options and rebuild caches."""
         for key, value in kwargs.items():
             if not hasattr(self, key):
                 raise AttributeError(key)
@@ -210,27 +239,36 @@ class TemplateMatcher:
             Xw = Xw / np.maximum(norms, 1e-9)
         self._Xw = Xw
         self._sq_norm = np.sum(Xw * Xw, axis=1)
-        self._scale = np.where(self.src == SRC_USER, self.user_weight, 1.0).astype(np.float32)
+        self._scale = np.where(
+            self.src == SRC_USER, self.user_weight, 1.0
+        ).astype(np.float32)
         self._classes = self.classes
         self._class_idx = [np.flatnonzero(self.y == c) for c in self._classes]
         self._dirty = False
 
     def _embed(self, Q: np.ndarray) -> np.ndarray:
-        """Weighted feature vectors (plus the hand-to-hand distances when rel_weight > 0)."""
+        """Weighted vectors, optionally including approximate contact relations."""
         Qw = Q * self._sqrt_w
         if self.rel_weight > 0:
-            Qw = np.hstack([Qw, relation_features(Q) * np.float32(np.sqrt(self.rel_weight))])
+            Qw = np.hstack([
+                Qw,
+                relation_features(Q) * np.float32(np.sqrt(self.rel_weight)),
+            ])
         return Qw
 
     def _distances(self, Q: np.ndarray) -> np.ndarray:
-        """Distances from each query row to every template, shape (M, N)."""
+        """Distances from each query row to all templates, shape (M, N)."""
         Q = np.atleast_2d(np.asarray(Q, dtype=np.float32))
         Qw = self._embed(Q)
         if self.metric == "cosine":
             Qw = Qw / np.maximum(np.linalg.norm(Qw, axis=1, keepdims=True), 1e-9)
             D = 1.0 - Qw @ self._Xw.T
         else:
-            d2 = np.sum(Qw * Qw, axis=1, keepdims=True) - 2.0 * (Qw @ self._Xw.T) + self._sq_norm[None, :]
+            d2 = (
+                np.sum(Qw * Qw, axis=1, keepdims=True)
+                - 2.0 * (Qw @ self._Xw.T)
+                + self._sq_norm[None, :]
+            )
             D = np.sqrt(np.maximum(d2, 0.0))
 
         if self.dual_order:
@@ -239,17 +277,23 @@ class TemplateMatcher:
                 Q_swap = swap_two_hands(Q[two])
                 Qw_swap = self._embed(Q_swap)
                 if self.metric == "cosine":
-                    Qw_swap = Qw_swap / np.maximum(np.linalg.norm(Qw_swap, axis=1, keepdims=True), 1e-9)
+                    Qw_swap = Qw_swap / np.maximum(
+                        np.linalg.norm(Qw_swap, axis=1, keepdims=True), 1e-9
+                    )
                     D_swap = 1.0 - Qw_swap @ self._Xw.T
                 else:
-                    d2_swap = np.sum(Qw_swap * Qw_swap, axis=1, keepdims=True) - 2.0 * (Qw_swap @ self._Xw.T) + self._sq_norm[None, :]
+                    d2_swap = (
+                        np.sum(Qw_swap * Qw_swap, axis=1, keepdims=True)
+                        - 2.0 * (Qw_swap @ self._Xw.T)
+                        + self._sq_norm[None, :]
+                    )
                     D_swap = np.sqrt(np.maximum(d2_swap, 0.0))
                 D[two] = np.minimum(D[two], D_swap)
 
         return D * self._scale[None, :]
 
     def class_scores(self, Q: np.ndarray) -> np.ndarray:
-        """Per-letter score (mean of the k smallest distances), shape (M, n_classes)."""
+        """Per-letter mean of k shortest distances, shape (M, n_classes)."""
         if self._dirty:
             self._prepare()
         Q = np.atleast_2d(np.asarray(Q, dtype=np.float32))
@@ -258,8 +302,61 @@ class TemplateMatcher:
         for j, idx in enumerate(self._class_idx):
             sub = D[:, idx]
             kk = min(self.k, sub.shape[1])
-            scores[:, j] = np.mean(np.partition(sub, kk - 1, axis=1)[:, :kk], axis=1)
+            scores[:, j] = np.mean(
+                np.partition(sub, kk - 1, axis=1)[:, :kk], axis=1
+            )
         return scores
+
+    # ------------------------------------------- EXPERIMENTAL E/O correction
+    def _rerank_eo(self, feat: np.ndarray, scores: np.ndarray) -> np.ndarray:
+        """Conservatively attempt E/D or O/U re-ranking using contact geometry.
+
+        Only intervenes on an initial D or U prediction when an approximate
+        fingertip-contact pattern clearly favors E or O respectively.
+        Not a validated accuracy fix: independently scaled hands can distort
+        cross-hand distances. Review true D/U false positives during testing.
+        """
+        x = np.asarray(feat, dtype=np.float32).reshape(-1)
+        if x.size != FEATURE_LEN:
+            return scores
+        if not (x[FLAGS_START] > 0.5 and x[FLAGS_START + 1] > 0.5):
+            return scores
+
+        best_idx = int(np.argmin(scores))
+        current = self._classes[best_idx]
+        if current not in ("D", "U"):
+            return scores
+
+        # Matrix: hand-1 tips (rows) vs hand-2 tips (columns).
+        d = relation_features(x)[0].reshape(5, 5)
+        # Index finger from either hand against the opposite hand's fingertips.
+        options = (d[1, :], d[:, 1])
+        tips = min(options, key=lambda v: float(np.min(v)))
+
+        nearest_idx = int(np.argmin(tips))
+        nearest = float(tips[nearest_idx])
+        second = float(np.partition(tips, 1)[1])
+
+        target = None
+        if current == "D" and nearest_idx == 1:
+            target = "E"
+        elif current == "U" and nearest_idx == 3:
+            target = "O"
+
+        if target is None or target not in self._classes:
+            return scores
+        if nearest > 0.16 or second - nearest < 0.07:
+            return scores
+
+        target_idx = self._classes.index(target)
+        if float(scores[target_idx] - scores[best_idx]) > 0.40:
+            return scores
+
+        updated = scores.copy()
+        updated[target_idx] = min(
+            float(updated[target_idx]), float(updated[best_idx]) - 0.28
+        )
+        return updated
 
     # ---------------------------------------------------------- prediction
     def predict(self, feat: np.ndarray) -> Prediction:
@@ -268,7 +365,18 @@ class TemplateMatcher:
             return Prediction(None, 0.0, rejection_reason="No templates available")
         if self._dirty:
             self._prepare()
+
         s = self.class_scores(feat)[0]
+        x = np.asarray(feat, dtype=np.float32).reshape(-1)
+
+        two_hands = (
+            x[FLAGS_START] > 0.5
+            and x[FLAGS_START + 1] > 0.5
+        )
+
+        if two_hands and "C" in self._classes:
+            s[self._classes.index("C")] = np.inf
+        s = self._rerank_eo(feat, s)  # Experimental E/D and O/U fix.
         shifted = -(s - s.min()) / max(self.temperature, 1e-6)
         p = np.exp(shifted - shifted.max())
         p /= p.sum()
@@ -277,12 +385,21 @@ class TemplateMatcher:
         best = int(order[0])
         distance = float(s[best])
         if distance > self.reject_distance:
-            return Prediction(None, 0.0, top3, distance,
-                              rejection_reason=f"Distance {distance:.2f} > max {self.reject_distance:.2f}")
-        return Prediction(self._classes[best], float(p[best]), top3, distance, rejection_reason=None)
+            return Prediction(
+                None, 0.0, top3, distance,
+                rejection_reason=(
+                    f"Distance {distance:.2f} > max {self.reject_distance:.2f}"
+                ),
+            )
+        return Prediction(
+            self._classes[best], float(p[best]), top3, distance,
+            rejection_reason=None,
+        )
 
-    def predict_labels(self, Q: np.ndarray, chunk: int = 256) -> Tuple[np.ndarray, np.ndarray]:
-        """Best letter and its score for many queries (used by evaluate.py)."""
+    def predict_labels(
+        self, Q: np.ndarray, chunk: int = 256
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Batch baseline (without E/O override), for existing evaluate.py."""
         if self._dirty:
             self._prepare()
         labels, best = [], []
