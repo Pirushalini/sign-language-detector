@@ -9,6 +9,9 @@ A desktop-based British Sign Language (BSL) fingerspelling recognition system th
 
 The system runs locally on CPU hardware without sending video frames or landmark data over the network. The core recognition pipeline uses an **instance-based template matcher** operating over normalized, scale- and position-invariant hand landmarks without neural network training. To handle the visual and physical nuances of fingerspelling, static template matching is paired with **Dynamic Time Warping (DTW)** for movement-based letters (**H** and **J**) and **raw-landmark contact geometry** for vowel disambiguation (**I** and **O**).
 
+## Technical Documentation
+
+For detailed system architecture, algorithms, and implementation, see [Project Documentation](PROJECT_DOCUMENTATION.md).
 ---
 
 ## Table of Contents
